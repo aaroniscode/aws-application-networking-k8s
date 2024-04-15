@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 
 	"github.com/aws/aws-application-networking-k8s/pkg/aws/services"
 	"github.com/aws/aws-application-networking-k8s/pkg/utils"
@@ -13,7 +14,6 @@ import (
 	pkg_aws "github.com/aws/aws-application-networking-k8s/pkg/aws"
 	model "github.com/aws/aws-application-networking-k8s/pkg/model/lattice"
 	"github.com/aws/aws-application-networking-k8s/pkg/utils/gwlog"
-	"reflect"
 )
 
 //go:generate mockgen -destination target_group_manager_mock.go -package lattice github.com/aws/aws-application-networking-k8s/pkg/deploy/lattice TargetGroupManager
@@ -258,7 +258,14 @@ func (s *defaultTargetGroupManager) List(ctx context.Context) ([]tgListOutput, e
 	tgArns := utils.SliceMap(resp, func(tg *vpclattice.TargetGroupSummary) string {
 		return aws.StringValue(tg.Arn)
 	})
-	tgArnToTagsMap, err := s.cloud.Tagging().GetTagsForArns(ctx, tgArns)
+
+	var tgArnToTagsMap map[string]map[string]*string
+
+	if s.cloud.Config().PrivateVPC {
+		tgArnToTagsMap, err = s.findTagsForARNsUsingLatticeAPI(ctx, tgArns)
+	} else {
+		tgArnToTagsMap, err = s.findTagsForARNsUsingTaggingAPI(ctx, tgArns)
+	}
 
 	if err != nil {
 		return nil, err
@@ -272,12 +279,44 @@ func (s *defaultTargetGroupManager) List(ctx context.Context) ([]tgListOutput, e
 	return tgList, err
 }
 
+func (s *defaultTargetGroupManager) findTagsForARNsUsingLatticeAPI(
+	ctx context.Context,
+	tgArns []string,
+) (map[string]map[string]*string, error) {
+	tgArnToTagsMap := map[string]map[string]*string{}
+
+	for _, tgArn := range tgArns {
+		tags, err := s.cloud.Lattice().ListTagsForResourceWithContext(ctx,
+			&vpclattice.ListTagsForResourceInput{ResourceArn: aws.String(tgArn)},
+		)
+		if err != nil {
+			return nil, err
+		}
+		tgArnToTagsMap[tgArn] = tags.Tags
+	}
+	return tgArnToTagsMap, nil
+}
+
+func (s *defaultTargetGroupManager) findTagsForARNsUsingTaggingAPI(
+	ctx context.Context,
+	tgArns []string,
+) (map[string]map[string]*string, error) {
+	return s.cloud.Tagging().GetTagsForArns(ctx, tgArns)
+}
+
 func (s *defaultTargetGroupManager) findTargetGroup(
 	ctx context.Context,
 	modelTargetGroup *model.TargetGroup,
 ) (*vpclattice.GetTargetGroupOutput, error) {
-	arns, err := s.cloud.Tagging().FindResourcesByTags(ctx, services.ResourceTypeTargetGroup,
-		model.TagsFromTGTagFields(modelTargetGroup.Spec.TargetGroupTagFields))
+	var arns []string
+	var err error
+
+	if s.cloud.Config().PrivateVPC {
+		arns, err = s.findTargetGroupARNsUsingLatticeAPI(ctx, modelTargetGroup)
+	} else {
+		arns, err = s.findTargetGroupARNsUsingTaggingAPI(ctx, modelTargetGroup)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -325,6 +364,45 @@ func (s *defaultTargetGroupManager) findTargetGroup(
 	}
 
 	return nil, nil
+}
+
+func (s *defaultTargetGroupManager) findTargetGroupARNsUsingLatticeAPI(
+	ctx context.Context,
+	modelTargetGroup *model.TargetGroup,
+) ([]string, error) {
+	tgs, err := s.cloud.Lattice().ListTargetGroupsAsList(ctx, &vpclattice.ListTargetGroupsInput{
+		VpcIdentifier: aws.String(s.cloud.Config().VpcId),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	arns := make([]string, 0, len(tgs))
+
+	for _, tg := range tgs {
+		tags, err := s.cloud.Lattice().ListTagsForResourceWithContext(ctx,
+			&vpclattice.ListTagsForResourceInput{ResourceArn: tg.Arn},
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		modelTags := model.TagsFromTGTagFields(modelTargetGroup.Spec.TargetGroupTagFields)
+
+		if containsTags(modelTags, tags.Tags) {
+			arns = append(arns, aws.StringValue(tg.Arn))
+		}
+	}
+
+	return arns, nil
+}
+
+func (s *defaultTargetGroupManager) findTargetGroupARNsUsingTaggingAPI(
+	ctx context.Context,
+	modelTargetGroup *model.TargetGroup,
+) ([]string, error) {
+	return s.cloud.Tagging().FindResourcesByTags(ctx, services.ResourceTypeTargetGroup,
+		model.TagsFromTGTagFields(modelTargetGroup.Spec.TargetGroupTagFields))
 }
 
 // Skips tag verification if not provided
@@ -421,4 +499,13 @@ func (s *defaultTargetGroupManager) fillDefaultHealthCheckConfig(hc *vpclattice.
 	if hc.UnhealthyThresholdCount == nil {
 		hc.UnhealthyThresholdCount = defaultCfg.UnhealthyThresholdCount
 	}
+}
+
+func containsTags(source, check services.Tags) bool {
+	for k, v := range source {
+		if aws.StringValue(check[k]) != aws.StringValue(v) {
+			return false
+		}
+	}
+	return true
 }

@@ -9,6 +9,7 @@ import (
 	"golang.org/x/exp/maps"
 
 	"context"
+
 	"github.com/aws/aws-application-networking-k8s/pkg/aws/services"
 	"github.com/aws/aws-application-networking-k8s/pkg/utils/gwlog"
 )
@@ -25,6 +26,7 @@ type CloudConfig struct {
 	AccountId   string
 	Region      string
 	ClusterName string
+	PrivateVPC  bool
 }
 
 type Cloud interface {
